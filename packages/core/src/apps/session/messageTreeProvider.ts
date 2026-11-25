@@ -19,6 +19,7 @@ export interface SessionGroupNode {
     destination: string;
     children: MessageLeafNode[];
     isAutoDeliver: boolean;
+    taskId?: string;
 }
 
 export interface MessageLeafNode {
@@ -44,7 +45,7 @@ export class MessageTreeProvider implements vscode.TreeDataProvider<MessageNode>
     private _onDidChangeTreeData = new vscode.EventEmitter<MessageNode | undefined>();
     readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
-    constructor(private _queuePath: () => string) {}
+    constructor(private _queuePath: () => string, private taskTitle?: (id: string) => string | undefined) {}
 
     reload(): void {
         this._onDidChangeTreeData.fire(undefined);
@@ -57,18 +58,31 @@ export class MessageTreeProvider implements vscode.TreeDataProvider<MessageNode>
             const autoDeliverySessions = readAutoDelivery(messagesPath);
             // Group by destination
             const groups = new Map<string, MessageLeafNode[]>();
+            const taskGroups = new Map<string, SessionGroupNode>();
             for (let i = 0; i < messages.length; i++) {
                 const m = messages[i];
-                if (!groups.has(m.destination)) { groups.set(m.destination, []); }
-                groups.get(m.destination)!.push({
+                const child: MessageLeafNode = {
                     kind: 'message',
                     destination: m.destination,
                     sender: m.sender || 'unknown',
                     text: m.text,
                     index: i,
-                });
+                };
+                if (m.taskId !== undefined) {
+                    const key = JSON.stringify([m.taskId, m.destination]);
+                    const group = taskGroups.get(key) ?? {
+                        kind: 'session', label: '', destination: m.destination, children: [],
+                        taskId: m.taskId, isAutoDeliver: autoDeliverySessions.includes(m.destination),
+                    };
+                    group.children.push(child);
+                    group.label = `${m.destination} (${group.children.length}) - ${this.taskTitle?.(m.taskId) ?? m.taskId}`;
+                    taskGroups.set(key, group);
+                } else {
+                    if (!groups.has(m.destination)) { groups.set(m.destination, []); }
+                    groups.get(m.destination)!.push(child);
+                }
             }
-            const result: MessageNode[] = [];
+            const result: MessageNode[] = [...taskGroups.values()];
             // Manual sessions (not in autoDelivery list)
             for (const [destination, children] of groups) {
                 if (!autoDeliverySessions.includes(destination)) {
@@ -95,6 +109,7 @@ export class MessageTreeProvider implements vscode.TreeDataProvider<MessageNode>
             const groups = new Map<string, MessageLeafNode[]>();
             for (let i = 0; i < messages.length; i++) {
                 const m = messages[i];
+                if (m.taskId !== undefined) { continue; }
                 if (!groups.has(m.destination)) { groups.set(m.destination, []); }
                 groups.get(m.destination)!.push({
                     kind: 'message',
@@ -136,7 +151,8 @@ export class MessageTreeProvider implements vscode.TreeDataProvider<MessageNode>
                 element.label,
                 vscode.TreeItemCollapsibleState.Collapsed
             );
-            item.contextValue = element.isAutoDeliver ? 'jarvisSessionAutoDeliver' : 'jarvisSessionManual';
+            item.contextValue = element.taskId !== undefined ? 'jarvisTaskMessages'
+                : element.isAutoDeliver ? 'jarvisSessionAutoDeliver' : 'jarvisSessionManual';
             item.command = {
                 command: 'jarvis.openMessageActorChat',
                 title: 'Open Session',

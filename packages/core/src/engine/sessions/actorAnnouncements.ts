@@ -11,6 +11,7 @@ export interface InboxMessage {
     text: string;
     timestamp: string;
     notified?: boolean;
+    taskId?: string;
 }
 
 export interface AnnouncerDeps {
@@ -19,7 +20,9 @@ export interface AnnouncerDeps {
     /** Names of the Actors with automatic delivery (US_COM_DELIVERY). */
     autoDelivery(): string[];
     /** Announces to the chat of the Actor, creating the chat first when there is none. Resolves when the announcement was handed to the Agent Host. */
-    announce(actorName: string, count: number): Promise<void>;
+    announce(actorName: string, count: number, taskId?: string): Promise<void>;
+    canDeliverTask?(taskId: string): boolean;
+    canDeliverLegacy?(actorName: string): boolean;
     changed(): void;
     log(severity: 'debug' | 'info' | 'warn', text: string): void;
 }
@@ -28,10 +31,10 @@ export interface Announcer {
     /** One pass over the Actors with automatic delivery. */
     runAuto(): Promise<void>;
     /** The User asks for the delivery to one Actor (the play action); throws when the delivery fails. Resolves with the number of messages announced. */
-    deliver(actorName: string): Promise<number>;
+    deliver(actorName: string, taskId?: string): Promise<number>;
 }
 
-const messageKey = (m: InboxMessage): string => `${m.destination}\x00${m.sender}\x00${m.timestamp}\x00${m.text}`;
+const messageKey = (m: InboxMessage): string => JSON.stringify([m.taskId, m.destination, m.sender, m.timestamp, m.text]);
 
 export function createAnnouncer(deps: AnnouncerDeps): Announcer {
     let tail: Promise<unknown> = Promise.resolve();
@@ -41,10 +44,11 @@ export function createAnnouncer(deps: AnnouncerDeps): Announcer {
         return run;
     };
 
-    async function announce(name: string, onlyNew: boolean): Promise<number> {
-        const pending = deps.readQueue().filter(m => m.destination === name && (!onlyNew || !m.notified));
+    async function announce(name: string, onlyNew: boolean, taskId?: string): Promise<number> {
+        if (taskId !== undefined ? !deps.canDeliverTask?.(taskId) : deps.canDeliverLegacy?.(name) === false) { return 0; }
+        const pending = deps.readQueue().filter(m => m.destination === name && m.taskId === taskId && (!onlyNew || !m.notified));
         if (pending.length === 0) { return 0; }
-        await deps.announce(name, pending.length);
+        await deps.announce(name, pending.length, taskId);
         // Marked only after the announcement was handed over, and only the messages it counted; a message that is marked is not announced again.
         const announced = new Set(pending.map(messageKey));
         const queue = deps.readQueue();
@@ -57,10 +61,13 @@ export function createAnnouncer(deps: AnnouncerDeps): Announcer {
     return {
         runAuto: () => serialized(async () => {
             for (const name of deps.autoDelivery()) {
-                try { await announce(name, true); }
-                catch (err) { deps.log('warn', `autoDelivery: delivery failed for "${name}": ${err instanceof Error ? err.message : err}`); }
+                const tasks = new Set(deps.readQueue().filter(m => m.destination === name && !m.notified).map(m => m.taskId));
+                for (const taskId of tasks) {
+                    try { await announce(name, true, taskId); }
+                    catch (err) { deps.log('warn', `autoDelivery: delivery failed for "${name}": ${err instanceof Error ? err.message : err}`); }
+                }
             }
         }),
-        deliver: name => serialized(() => announce(name, false)),
+        deliver: (name, taskId) => serialized(() => announce(name, false, taskId)),
     };
 }

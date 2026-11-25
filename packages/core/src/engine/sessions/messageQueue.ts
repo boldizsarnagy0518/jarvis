@@ -15,6 +15,7 @@ export interface QueuedMessage {
     text: string;        // message content
     timestamp: string;   // ISO 8601
     notified?: boolean;  // true after auto-delivery notification sent
+    taskId?: string;
 }
 
 // --- Internal helpers: tolerant single-path read ---
@@ -36,7 +37,7 @@ function tryUnlink(filePath: string | undefined): void {
 // --- Union read / write-current / remove-after-persist (SPEC_CFG_STATEMIGRATION) ---
 
 function messageIdentity(m: QueuedMessage): string {
-    return `${m.destination}\x00${m.sender}\x00${m.text}\x00${m.timestamp}`;
+    return JSON.stringify([m.taskId, m.destination, m.sender, m.text, m.timestamp]);
 }
 
 /**
@@ -107,8 +108,8 @@ export function removeAutoDelivery(_messagesPath: string, sessionName: string): 
     writeAndRemoveLegacy(adPath, getLegacyAutoDeliveryPath(), filtered, legacyPresent);
 }
 
-export function appendMessage(filePath: string, destination: string, sender: string, text: string): void {
-    const message: QueuedMessage = { destination, sender, text, timestamp: new Date().toISOString() };
+export function appendMessage(filePath: string, destination: string, sender: string, text: string, taskId?: string): void {
+    const message: QueuedMessage = { destination, sender, text, timestamp: new Date().toISOString(), taskId };
     const { entries: queue, legacyPresent } = unionReadQueue(filePath, getLegacyMessagesPath());
     queue.push(message);
     writeAndRemoveLegacy(filePath, getLegacyMessagesPath(), queue, legacyPresent);
@@ -134,12 +135,13 @@ export function deleteByDestination(filePath: string, destination: string): void
 
 // Implementation: SPEC_MSG_QUEUESTORE
 // Requirements: REQ_COM_CAPABILITY
-export function popMessage(filePath: string, destination: string): { message: QueuedMessage | null; remaining: number } {
+export function popMessage(filePath: string, destination: string, taskId?: string): { message: QueuedMessage | null; remaining: number } {
     const { entries: queue, legacyPresent } = unionReadQueue(filePath, getLegacyMessagesPath());
-    const idx = queue.findIndex(m => m.destination === destination);
+    const matches = (m: QueuedMessage): boolean => m.destination === destination && m.taskId === taskId;
+    const idx = queue.findIndex(matches);
     if (idx === -1) { return { message: null, remaining: 0 }; }
     const [message] = queue.splice(idx, 1);
-    const remaining = queue.filter(m => m.destination === destination).length;
+    const remaining = queue.filter(matches).length;
     writeAndRemoveLegacy(filePath, getLegacyMessagesPath(), queue, legacyPresent);
     return { message, remaining };
 }

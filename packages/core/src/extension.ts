@@ -5,6 +5,7 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
+import { randomUUID } from 'crypto';
 import * as configPaths from './engine/core/configPaths';
 import { MessageTreeProvider, SessionGroupNode, MessageLeafNode } from './apps/session/messageTreeProvider';
 import { RemindersTreeProvider, ReminderNode } from './apps/session/remindersTreeProvider';
@@ -25,16 +26,20 @@ import { setAssetProvisioningLogger, provisionModuleAssets } from './engine/core
 import { announceIfNewVersion, showReleaseNotes } from './engine/core/releaseNotes';
 import { ActorScanner, ambiguousActorMessage } from './engine/actors/actorScanner';
 import { ActorMailState } from './engine/actors/actorMail';
-import { ActorActivity } from './engine/actors/actorActivity';
+import { ActorActivity, activityForStatus } from './engine/actors/actorActivity';
 import { ActorTreeProvider, ActorNode } from './engine/actors/actorTreeProvider';
 import { actorNameProblem, existingActorFolder, writeActorFiles } from './engine/actors/actorCreation';
 import { ensureActorAgent, setActorAgentLogger } from './engine/actors/actorAgent';
 import { createActorHandler } from './engine/actors/actorRuntime';
 import { registerJarvisYamlSchemaContributor } from './engine/core/yamlSchemaContributor';
-import { AhpClient, userDataDirFromGlobalStorage } from './engine/ahp';
+import { AhpClient, userDataDirFromGlobalStorage, type ActorChatRequest } from './engine/ahp';
 import { createActorMessageTools } from './engine/sessions/actorMessageTools';
 import { createAnnouncer } from './engine/sessions/actorAnnouncements';
-import { openActorChat } from './engine/sessions/openActorChat';
+import { editorResource, openActorChat } from './engine/sessions/openActorChat';
+import { createTaskUsageTool } from './engine/sessions/taskUsage';
+import { registerTaskUsageView } from './apps/session/taskUsageView';
+import { WorkflowTasks, isTaskActor, type TaskActor, type WorkflowState } from './engine/sessions/workflowTasks';
+import { registerWorkflowTasksView } from './apps/session/workflowTasksView';
 
 import { CronExpressionParser } from 'cron-parser';
 
@@ -58,7 +63,10 @@ export function activate(context: vscode.ExtensionContext): JarvisCoreApi {
         return configPaths.getMessagesPath() ?? '';
     }
 
-    const messageProvider = new MessageTreeProvider(resolveMessagesPath);
+    let workflowTasks: WorkflowTasks | undefined;
+    let refreshTasks = (): void => undefined;
+    let refreshTaskUsage = (): void => undefined;
+    const messageProvider = new MessageTreeProvider(resolveMessagesPath, id => workflowTasks?.tasks.find(task => task.id === id)?.title);
 
     // Implementation: SPEC_DEV_LOGCHANNEL
     const log = vscode.window.createOutputChannel('Jarvis', { log: true });
@@ -145,17 +153,85 @@ export function activate(context: vscode.ExtensionContext): JarvisCoreApi {
     };
 
     /** The Actor with its agent file in place (a description is what makes the host list it), ready for its chat. */
-    async function resolveActorForChat(actorName: string): Promise<{ name: string; startupText: string }> {
+    async function resolveActorForChat(actorName: string, taskId?: string): Promise<ActorChatRequest> {
         const lookup = actorScanner.resolveName(actorName);
         if (lookup.status === 'ambiguous') { throw new Error(ambiguousActorMessage(actorName, lookup.matches)); }
         if (lookup.status === 'unknown') { throw new Error(`Actor not found: ${actorName}`); }
         const actor = lookup.actor;
         await ensureActorAgent({ name: actor.name, folder: actor.folder, summary: actor.summary });
-        return { name: actor.name, startupText: startupTextFor(actor) };
+        const settings = vscode.workspace.getConfiguration('jarvis');
+        const configured = settings.get<Record<string, string>>('agentSession.models')?.[actor.name];
+        const modelId = typeof configured === 'string' ? configured.trim() : '';
+        const actors = settings.inspect<string[]>('agentSession.autoApproveActors')?.workspaceValue;
+        const autoApprove = vscode.workspace.isTrusted && Array.isArray(actors) && actors.includes(actor.name);
+        const request: ActorChatRequest = { name: actor.name, startupText: startupTextFor(actor), ...(modelId ? { modelId } : {}), ...(autoApprove ? { autoApprove } : {}) };
+        if (taskId !== undefined) {
+            if (!workflowTasks?.isActive(taskId) || !isTaskActor(actor.name)) { throw new Error('No active Jarvis task for this Actor.'); }
+            request.task = workflowTasks.binding(taskId, actor.name);
+        }
+        return request;
     }
 
     const userDataDir = userDataDirFromGlobalStorage(context.globalStorageUri.fsPath);
     const ahpWorkspace = configPaths.getWorkspaceRoot();
+    if (ahpWorkspace) {
+        const stateKey = `jarvis.workflowTasks.v1:${ahpWorkspace}`;
+        const contract = path.join(ahpWorkspace, '.jarvis', 'current-plan.md');
+        workflowTasks = new WorkflowTasks(context.workspaceState.get<WorkflowState>(stateKey, { tasks: [], previousContract: null }), {
+            save: state => context.workspaceState.update(stateKey, state),
+            readContract: () => {
+                if (vscode.workspace.textDocuments.some(doc => doc.uri.scheme === 'file' && !path.relative(contract, doc.uri.fsPath) && doc.isDirty)) {
+                    throw new Error('Save the current task contract before switching tasks.');
+                }
+                try { return fs.readFileSync(contract, 'utf8'); }
+                catch (error) {
+                    if ((error as NodeJS.ErrnoException).code === 'ENOENT') { return null; }
+                    throw error;
+                }
+            },
+            writeContract: contents => {
+                if (contents === null) { if (fs.existsSync(contract)) { fs.unlinkSync(contract); } }
+                else {
+                    fs.mkdirSync(path.dirname(contract), { recursive: true });
+                    const temporary = `${contract}.${randomUUID()}.tmp`;
+                    try {
+                        fs.writeFileSync(temporary, contents, { encoding: 'utf8', flag: 'wx' });
+                        fs.renameSync(temporary, contract);
+                    } finally { if (fs.existsSync(temporary)) { fs.unlinkSync(temporary); } }
+                }
+            },
+            checkIdle: async task => {
+                if (!vscode.workspace.isTrusted) { throw new Error('Jarvis tasks require a trusted workspace.'); }
+                if (!ahpClient?.isConnected()) { throw new Error('Connect to the Agent Host before switching tasks.'); }
+                const sessions = await ahpClient.listActorChatSessions();
+                const busy = sessions.find(chat => (
+                    isTaskActor(chat.title) || workflowTasks?.taskForSession(chat.session)
+                ) && ['waiting', 'working'].includes(activityForStatus(chat.status ?? 0)));
+                if (busy) { throw new Error(`Wait for the current turn in "${busy.title}" to finish before switching tasks.`); }
+                for (const chat of sessions) {
+                    const bound = workflowTasks?.taskForSession(chat.session);
+                    if (!chat.archived && (bound ? bound.id === task.id && !bound.retired : isTaskActor(chat.title))
+                        && await ahpClient.hasPendingWork(chat.session)) {
+                        throw new Error(`Wait for the queued or active turn in "${chat.title}" before switching tasks.`);
+                    }
+                }
+            },
+            changed: () => { refreshTasks(); refreshTaskUsage(); messageProvider.reload(); },
+        });
+        refreshTaskUsage = registerTaskUsageView(context, ahpWorkspace, () => workflowTasks?.tasks ?? [], userDataDir);
+        if (vscode.workspace.isTrusted) {
+            void workflowTasks.recover().catch(error => { void vscode.window.showWarningMessage(`Jarvis: ${String(error)}`); });
+        }
+    }
+    const canUseLegacy = (actorName: string): boolean => !isTaskActor(actorName) || !workflowTasks?.ownsContract;
+    function inTask<T>(actorName: string, taskId: string | undefined, work: () => Promise<T>): Promise<T> {
+        if (!workflowTasks) { return work(); }
+        if (taskId !== undefined) { return workflowTasks.run(taskId, work); }
+        return isTaskActor(actorName) ? workflowTasks.runLegacy(work) : work();
+    }
+    const ensureChat = (actorName: string, taskId?: string): Promise<string> => inTask(actorName, taskId, async () => (
+        await ahpClient!.ensureActorChat(await resolveActorForChat(actorName, taskId))
+    ).session);
     if (userDataDir) {
         ahpClient = new AhpClient({
             userDataDir,
@@ -164,7 +240,12 @@ export function activate(context: vscode.ExtensionContext): JarvisCoreApi {
             messagePath: ahpWorkspace ? {
                 workspaceFolder: ahpWorkspace,
                 actorNames: () => actorScanner.actors.map(a => a.name),
-                tools: createActorMessageTools({
+                isTaskSession: session => !!workflowTasks?.taskForSession(session),
+                isActiveTaskSession: session => {
+                    const task = workflowTasks?.taskForSession(session);
+                    return !!task && !task.retired && (workflowTasks?.isActive(task.id) ?? false);
+                },
+                tools: [...createActorMessageTools({
                     actors: () => actorScanner.actors.map(a => ({ name: a.name, summary: a.summary })),
                     lookup: name => {
                         const found = actorScanner.resolveName(name);
@@ -172,12 +253,16 @@ export function activate(context: vscode.ExtensionContext): JarvisCoreApi {
                         if (found.status === 'ambiguous') { return { status: 'ambiguous', message: ambiguousActorMessage(name, found.matches) }; }
                         return { status: 'unknown' };
                     },
-                    appendMessage: (destination, sender, text) => appendMessage(resolveMessagesPath(), destination, sender, text),
-                    popMessage: destination => popMessage(resolveMessagesPath(), destination),
-                    ensureChat: async actorName => (await ahpClient!.ensureActorChat(await resolveActorForChat(actorName))).session,
+                    taskForSession: session => workflowTasks?.taskForSession(session),
+                    isActiveTask: id => workflowTasks?.isActive(id) ?? false,
+                    isTaskActor,
+                    canUseLegacy,
+                    appendMessage: (destination, sender, text, taskId) => appendMessage(resolveMessagesPath(), destination, sender, text, taskId),
+                    popMessage: (destination, taskId) => popMessage(resolveMessagesPath(), destination, taskId),
+                    ensureChat,
                     changed: () => messageProvider.reload(),
                     log: text => log.info(`[MSG] ${text}`),
-                }),
+                }), createTaskUsageTool(ahpWorkspace)],
             } : undefined,
         });
         context.subscriptions.push(
@@ -194,21 +279,26 @@ export function activate(context: vscode.ExtensionContext): JarvisCoreApi {
         readQueue: () => readQueue(resolveMessagesPath()),
         writeQueue: messages => writeQueue(resolveMessagesPath(), messages),
         autoDelivery: () => readAutoDelivery(resolveMessagesPath()).filter(name => actorScanner.resolveName(name).status === 'found'),
-        announce: async (actorName, count) => {
-            const actor = await resolveActorForChat(actorName);
+        canDeliverTask: id => workflowTasks?.isActive(id) ?? false,
+        canDeliverLegacy: canUseLegacy,
+        announce: (actorName, count, taskId) => inTask(actorName, taskId, async () => {
+            const actor = await resolveActorForChat(actorName, taskId);
             await ahpClient!.deliverAnnouncement(actor, count);
-        },
+        }),
         changed: () => messageProvider.reload(),
         log: (severity, text) => log[severity](`[MSG] ${text}`),
     });
 
-    async function deliverViaAhp(destination: string): Promise<void> {
+    async function deliverViaAhp(destination: string, taskId?: string): Promise<void> {
         if (!ahpClient?.isConnected()) {
             void vscode.window.showInformationMessage('Jarvis: Not connected to the Agent Host; messages remain in the inbox.');
             return;
         }
         try {
-            await announcer.deliver(destination);
+            if (taskId !== undefined ? !workflowTasks?.isActive(taskId) : !canUseLegacy(destination)) {
+                throw new Error(taskId !== undefined ? 'Resume the task before delivering its messages.' : 'The legacy inbox is separate from the active task.');
+            }
+            await announcer.deliver(destination, taskId);
         } catch (err) {
             void vscode.window.showWarningMessage(`Jarvis: Could not announce the messages to "${destination}": ${err instanceof Error ? err.message : err}`);
         }
@@ -332,19 +422,25 @@ export function activate(context: vscode.ExtensionContext): JarvisCoreApi {
                 return;
             }
             log.info(`[MSG] sendMessages: destination="${node.destination}", count=${node.children.length}`);
-            await deliverViaAhp(node.destination);
+            await deliverViaAhp(node.destination, node.taskId);
             messageProvider.reload();
         }
     );
 
     async function openChat(name: string, create: boolean): Promise<void> {
         try {
+            if (!canUseLegacy(name)) {
+                const task = workflowTasks?.active;
+                if (!task || !isTaskActor(name)) { throw new Error('Wait for the task switch to finish.'); }
+                await openTaskChat(task.id, name);
+                return;
+            }
             await openActorChat(name, create, {
                 connected: () => !!ahpClient?.isConnected(),
                 offline: () => { void vscode.window.showInformationMessage('Jarvis: Not connected to the Agent Host.'); },
                 isActor: actorName => actorScanner.resolveName(actorName).status === 'found',
                 find: actorName => ahpClient!.findActorChat(actorName),
-                ensure: async actorName => (await ahpClient!.ensureActorChat(await resolveActorForChat(actorName))).session,
+                ensure: ensureChat,
                 groups: () => vscode.window.tabGroups.all.map(group => ({
                     viewColumn: group.viewColumn,
                     uris: group.tabs.map(tab => (tab.input as { uri?: vscode.Uri } | undefined)?.uri?.toString()),
@@ -360,10 +456,46 @@ export function activate(context: vscode.ExtensionContext): JarvisCoreApi {
         }
     }
 
+    async function openTaskChat(taskId: string, actor: TaskActor, createIfMissing = false): Promise<void> {
+        const tasks = workflowTasks;
+        const client = ahpClient;
+        if (!tasks?.isActive(taskId) || !isTaskActor(actor)) { throw new Error('Resume the task before opening its chat.'); }
+        if (!client?.isConnected()) { throw new Error('Not connected to the Agent Host.'); }
+        const original = tasks.binding(taskId, actor).session();
+        if (!original && !createIfMissing) { throw new Error(`The "${actor}" chat will appear after its first handoff.`); }
+        if (original && !(await client.listActorChatSessions()).some(chat => chat.session === original)) {
+            const choice = 'Create Fresh Chat';
+            const answer = await vscode.window.showWarningMessage(`The original "${actor}" chat is not available.`, {
+                modal: true, detail: 'A replacement will use the saved task contract, but will not have the original conversation history.',
+            }, choice);
+            if (answer !== choice) { return; }
+            if ((await client.listActorChatSessions()).some(chat => chat.session === original)) { throw new Error('The original chat is available again. Open it from Tasks.'); }
+            await tasks.retire(taskId, actor, original);
+        }
+        await tasks.run(taskId, async () => {
+            const uri = vscode.Uri.parse(editorResource(await ensureChat(actor, taskId)));
+            const existing = vscode.window.tabGroups.all.find(group => group.tabs.some(tab => (
+                (tab.input as { uri?: vscode.Uri } | undefined)?.uri?.toString() === uri.toString()
+            )));
+            await vscode.commands.executeCommand('vscode.open', uri, { viewColumn: existing?.viewColumn ?? vscode.ViewColumn.One, preview: false });
+        });
+    }
+
+    if (workflowTasks) {
+        refreshTasks = registerWorkflowTasksView(context, workflowTasks, {
+            checkLead: async () => { await resolveActorForChat('lead'); },
+            open: openTaskChat,
+            resumed: () => { if (ahpClient?.isConnected()) { void announcer.runAuto(); } },
+        });
+    }
+
     const openMessageActorChatCommand = vscode.commands.registerCommand(
         'jarvis.openMessageActorChat',
         async (node: SessionGroupNode) => {
-            await openChat(node.destination, false);
+            if (node.taskId !== undefined) {
+                await vscode.commands.executeCommand('jarvis.workflowTask.openChat', node.taskId, node.destination);
+            } else if (canUseLegacy(node.destination)) { await openChat(node.destination, false); }
+            else { void vscode.window.showInformationMessage('Jarvis: This inbox is separate from the active task.'); }
         }
     );
 

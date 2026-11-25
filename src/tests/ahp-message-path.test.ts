@@ -35,6 +35,10 @@ class RichHost {
     sessions = new Map<string, FakeSession>();
     dispatched: Dispatched[] = [];
     createParams: any[] = [];
+    approvalRequests: { channel: string; enabled: boolean }[] = [];
+    approvalError?: { code: number; message: string };
+    availableApprovalModes?: string[];
+    multiProvider = false;
     clientIds: string[] = [];
     /** Names of the agent files the host lists in the customizations of a session; `undefined` list means none. */
     agents: { name: string; uri: string }[] = [];
@@ -47,6 +51,7 @@ class RichHost {
     private pendingSubs = new Map<string, { id: number; timer: NodeJS.Timeout }>();
     private ws: WebSocket | undefined;
     private seq = 100;
+    readonly queuedChats = new Set<string>();
     readonly pipe: string;
     readonly token = 'tok-msg';
     private server = http.createServer();
@@ -121,11 +126,24 @@ class RichHost {
             const s = this.addSession('', '', new Date().toISOString(), p.channel);
             s.workingDirectories = p.workingDirectories;
             s.activeClient = p.activeClient;
+        } else if (msg.method === 'extensions/setSessionApproveAll') {
+            this.approvalRequests.push(p);
+            if (this.approvalError) {
+                this.ws?.send(JSON.stringify({ jsonrpc: '2.0', id: msg.id, error: this.approvalError }));
+                return;
+            }
         } else if (msg.method === 'subscribe') {
             const s = this.sessions.get(p.channel);
-            result = s
-                ? { snapshot: { resource: p.channel, state: { title: s.title, chats: [{ resource: s.chat }], defaultChat: s.chat, customizations: this.customizations() } } }
-                : { snapshot: { resource: p.channel, state: { turns: [] } } };
+            const config = this.availableApprovalModes && {
+                schema: { properties: { autoApprove: { chatMutable: true, sessionMutable: true, enum: ['default', 'autoApprove'] } } },
+                values: { availableApprovalModes: this.availableApprovalModes },
+            };
+            result = p.channel === 'ahp-root://' ? { snapshot: { state: { config: {
+                schema: { properties: { 'multipleChatProviders.enabled': { type: 'boolean' } } },
+                values: { 'multipleChatProviders.enabled': this.multiProvider },
+            } } } } : s
+                ? { snapshot: { resource: p.channel, state: { title: s.title, chats: [{ resource: s.chat }], defaultChat: s.chat, customizations: this.customizations(), config } } }
+                : { snapshot: { resource: p.channel, state: { turns: [], queuedMessages: this.queuedChats.has(p.channel) ? [{ id: 'queued' }] : [] } } };
             if (this.subscribeDelayMs) {
                 const prev = this.pendingSubs.get(p.channel);
                 if (prev) {
@@ -177,7 +195,7 @@ async function until(cond: () => boolean, what: string, ms = 4000): Promise<void
     }
 }
 
-async function connected(host: RichHost, over: { actors?: string[]; tools?: AhpToolSpec[]; agentWaitCreateMs?: number; agentWaitExistingMs?: number; ackTimeoutMs?: number } = {}) {
+async function connected(host: RichHost, over: { actors?: string[]; tools?: AhpToolSpec[]; agentWaitCreateMs?: number; agentWaitExistingMs?: number; ackTimeoutMs?: number; isTaskSession?: (session: string) => boolean } = {}) {
     const lines: string[] = [];
     const calls: Call[] = [];
     const client = new AhpClient({
@@ -188,6 +206,7 @@ async function connected(host: RichHost, over: { actors?: string[]; tools?: AhpT
         messagePath: {
             workspaceFolder: WORKSPACE,
             actorNames: () => over.actors ?? ['Developer', 'Architect'],
+            isTaskSession: over.isTaskSession,
             tools: over.tools ?? makeTools(calls),
             agentWaitCreateMs: over.agentWaitCreateMs ?? 300,
             agentWaitExistingMs: over.agentWaitExistingMs ?? 100,
@@ -201,6 +220,45 @@ async function connected(host: RichHost, over: { actors?: string[]; tools?: AhpT
 }
 
 const REQ = (name: string) => ({ name, startupText: `You are the Actor "${name}". Read your memory.` });
+
+describe('task chat identity', () => {
+    it('never adopts a same-name session, even on legacy lookup or a task return', async () => {
+        const host = await new RichHost().start();
+        const legacy = host.addSession('Developer', WORKSPACE, '2026-10-28T10:00:00Z');
+        host.agents = [{ name: 'Developer', uri: AGENT_URI('Developer') }];
+        const bindings = new Map<string, string>();
+        const request = (id: string) => ({ ...REQ('Developer'), task: {
+            id, session: () => bindings.get(id), bind: async (session: string) => { bindings.set(id, session); },
+        } });
+        const options = { isTaskSession: (session: string) => [...bindings.values()].includes(session) };
+        const first = await connected(host, options);
+        const [chatA, repeatedA] = await Promise.all([
+            first.client.ensureActorChat(request('task-a')), first.client.ensureActorChat(request('task-a')),
+        ]);
+        expect(chatA.created).toBe(true);
+        expect(repeatedA).toEqual({ session: chatA.session, created: false });
+        const chatB = await first.client.ensureActorChat(request('task-b'));
+        expect(new Set([legacy.uri, chatA.session, chatB.session]).size).toBe(3);
+        expect(await first.client.findActorChat('Developer')).toBe(legacy.uri);
+        first.client.dispose();
+        const resumed = await connected(host, options);
+        const delivered = await resumed.client.deliverAnnouncement(request('task-a'), 1);
+        expect(delivered).toEqual({ session: chatA.session, created: false });
+        expect(host.ofType('chat/pendingMessageSet').at(-1)?.channel).toBe(host.sessions.get(chatA.session)?.chat);
+        host.sessions.delete(chatA.session);
+        await expect(resumed.client.deliverAnnouncement(request('task-a'), 1)).rejects.toThrow('original chat');
+        expect(host.createParams).toHaveLength(2);
+    });
+
+    it('reports a queued turn even when the session status is idle', async () => {
+        const host = await new RichHost().start();
+        const session = host.addSession('Developer', WORKSPACE, '2026-10-28T10:00:00Z');
+        const { client } = await connected(host);
+        expect(await client.hasPendingWork(session.uri)).toBe(false);
+        host.queuedChats.add(session.chat);
+        expect(await client.hasPendingWork(session.uri)).toBe(true);
+    });
+});
 
 describe('SPEC_COM_BINDING: working folders', () => {
     it('compares folders across the spellings of the extension host and of the Agent Host', () => {
@@ -296,7 +354,9 @@ describe('SPEC_COM_BINDING: creating the chat (REQ_COM_CHATNAME AC-1, REQ_COM_NO
 
         const p = host.createParams[0];
         expect(p.provider).toBe('copilotcli');
+        expect(p).not.toHaveProperty('model');
         expect(p.config).toEqual({ isolation: 'folder' });
+        expect(host.approvalRequests).toEqual([]);
         expect(folderKey(p.workingDirectories[0])).toBe(folderKey(WORKSPACE));
         expect(p.activeClient.tools.map((t: { name: string }) => t.name)).toEqual(['jarvis_createActorSession', 'jarvis_sendToActor', 'jarvis_receiveFromActor', 'jarvis_findActors']);
         expect(p.activeClient.tools[0].handler).toBeUndefined();
@@ -307,9 +367,82 @@ describe('SPEC_COM_BINDING: creating the chat (REQ_COM_CHATNAME AC-1, REQ_COM_NO
         expect(startup.action.kind).toBe('queued');
         expect(startup.action.message.text).toBe('You are the Actor "Developer". Read your memory.');
         expect(startup.action.message.agent).toEqual({ uri: AGENT_URI('Developer') });
+        expect(startup.action.message).not.toHaveProperty('model');
         expect(startup.action.message.origin).toEqual({ kind: 'user' });
         expect(host.ofType('session/titleChanged')[0].action.title).toBe('Developer');
         expect(host.ofType('session/titleChanged')[0].channel).toBe(chat.session);
+    });
+
+    it('passes the requested model on session creation, startup and delivery to the existing chat', async () => {
+        const host = await new RichHost().start();
+        host.agents = [{ name: 'Developer', uri: AGENT_URI('Developer') }];
+        const { client } = await connected(host);
+        const req = { ...REQ('Developer'), modelId: 'claude-haiku-5.5' };
+        const initial = await client.ensureActorChat(req);
+        const delivery = await client.deliverAnnouncement(req, 1);
+
+        expect(delivery).toEqual({ session: initial.session, created: false });
+        expect(host.createParams).toHaveLength(1);
+        expect(host.createParams[0].model).toEqual({ id: req.modelId });
+        expect(host.ofType('chat/pendingMessageSet').map(event => event.action.message.model))
+            .toEqual([{ id: req.modelId }, { id: req.modelId }]);
+    });
+
+    it('opts in on creation and only requests approval on reused chats for opted-in Actors', async () => {
+        const host = await new RichHost().start();
+        host.agents = ['Developer', 'Architect'].map(name => ({ name, uri: AGENT_URI(name) }));
+        const { client } = await connected(host);
+        const worker = { ...REQ('Developer'), autoApprove: true };
+        const created = await client.ensureActorChat(worker);
+        await client.ensureActorChat(REQ('Architect'));
+        await client.deliverAnnouncement(worker, 1);
+        await client.deliverAnnouncement(REQ('Architect'), 1);
+        expect(host.createParams.map(params => params.config)).toEqual([
+            { isolation: 'folder', autoApprove: 'autoApprove' }, { isolation: 'folder' },
+        ]);
+        expect(host.approvalRequests).toEqual([{ channel: created.session, enabled: true }]);
+    });
+
+    it('delivers to the existing chat when its host does not support the approval RPC', async () => {
+        const host = await new RichHost().start();
+        host.agents = [{ name: 'Developer', uri: AGENT_URI('Developer') }];
+        const existing = host.addSession('Developer', WORKSPACE, '2026-10-28T10:00:00Z');
+        host.approvalError = { code: -32601, message: 'Method not found: extensions/setSessionApproveAll' };
+        const { client } = await connected(host);
+        await expect(client.deliverAnnouncement({ ...REQ('Developer'), autoApprove: true }, 1))
+            .resolves.toEqual({ session: existing.uri, created: false });
+        expect(host.createParams).toEqual([]);
+        const queued = host.ofType('chat/pendingMessageSet');
+        expect(queued).toHaveLength(1);
+        expect(queued[0].channel).toBe(existing.chat);
+    });
+
+    it('reports an approval rejection without sending the automatic turn', async () => {
+        const host = await new RichHost().start();
+        host.addSession('Developer', WORKSPACE, '2026-10-28T10:00:00Z');
+        host.approvalError = { code: -32600, message: 'Auto approval is restricted by policy' };
+        const { client } = await connected(host);
+        await expect(client.deliverAnnouncement({ ...REQ('Developer'), autoApprove: true }, 1))
+            .rejects.toThrow('Auto approval is restricted by policy');
+        expect(host.ofType('chat/pendingMessageSet')).toEqual([]);
+    });
+
+    it.each(['chat', 'session', 'disabled'])('uses native approval configuration only when advertised (%s)', async scope => {
+        const host = await new RichHost().start();
+        host.agents = [{ name: 'Developer', uri: AGENT_URI('Developer') }];
+        const existing = host.addSession('Developer', WORKSPACE, '2026-10-28T10:00:00Z');
+        host.approvalError = { code: -32601, message: 'Method not found: extensions/setSessionApproveAll' };
+        host.availableApprovalModes = scope === 'disabled' ? ['default'] : ['default', 'autoApprove'];
+        host.multiProvider = scope === 'session';
+        const { client } = await connected(host);
+        await client.deliverAnnouncement({ ...REQ('Developer'), autoApprove: true }, 1);
+        const actions = host.dispatched.filter(entry => ['chat/configChanged', 'session/configChanged', 'chat/pendingMessageSet'].includes(entry.action.type));
+        expect(actions.map(entry => entry.action.type)).toEqual(scope === 'disabled'
+            ? ['chat/pendingMessageSet'] : [`${scope}/configChanged`, 'chat/pendingMessageSet']);
+        if (scope !== 'disabled') {
+            expect(actions[0].action.config).toEqual({ autoApprove: 'autoApprove' });
+            expect(actions[0].channel).toBe(scope === 'session' ? host.approvalRequests[0].channel : existing.chat);
+        }
     });
 
     it('never uses turnStarted, which would replace a running turn (REQ_COM_NOTIFY AC-4)', async () => {

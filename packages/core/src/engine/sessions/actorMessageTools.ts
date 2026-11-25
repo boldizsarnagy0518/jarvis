@@ -16,10 +16,14 @@ export type ActorLookupResult =
 export interface ActorMessageToolDeps {
     actors(): { name: string; summary: string }[];
     lookup(name: string): ActorLookupResult;
-    appendMessage(destination: string, sender: string, text: string): void;
-    popMessage(destination: string): { message: { sender: string; text: string; timestamp: string } | null; remaining: number };
+    taskForSession?(session: string): { id: string; actor: string; retired?: boolean } | undefined;
+    isActiveTask?(id: string): boolean;
+    isTaskActor?(name: string): boolean;
+    canUseLegacy?(name: string): boolean;
+    appendMessage(destination: string, sender: string, text: string, taskId?: string): void;
+    popMessage(destination: string, taskId?: string): { message: { sender: string; text: string; timestamp: string } | null; remaining: number };
     /** Finds or creates the chat of an Actor and returns its session address. */
-    ensureChat(actorName: string): Promise<string>;
+    ensureChat(actorName: string, taskId?: string): Promise<string>;
     /** The inbox changed: the Messages view reads it again. */
     changed(): void;
     log(text: string): void;
@@ -45,7 +49,10 @@ export function createActorMessageTools(deps: ActorMessageToolDeps): AhpToolSpec
     };
 
     /** The Actor whose name equals the title of the calling session (SPEC_COM_BINDING). */
-    const callerActor = (ctx: ToolCallContext): { name: string } | ToolResult => {
+    const callerActor = (ctx: ToolCallContext): { name: string; taskId?: string } | ToolResult => {
+        const task = deps.taskForSession?.(ctx.session);
+        if (task?.retired) { return fail('This chat was replaced. Open the current chat in Jarvis Tasks.'); }
+        if (task) { return { name: task.actor, taskId: task.id }; }
         const found = deps.lookup(ctx.title);
         if (found.status === 'found') { return { name: found.name }; }
         if (found.status === 'ambiguous') { return fail(found.message); }
@@ -75,7 +82,8 @@ export function createActorMessageTools(deps: ActorMessageToolDeps): AhpToolSpec
                 const dest = deps.lookup(to);
                 if (dest.status === 'ambiguous') { return fail(dest.message); }
                 if (dest.status === 'unknown') { return fail(`Actor "${to}" does not exist.\nValid Actors: ${sortedNames()}`); }
-                deps.appendMessage(dest.name, caller.name, text);
+                if (caller.taskId && deps.isTaskActor?.(dest.name) === false) { return fail(`Actor "${dest.name}" does not participate in Jarvis tasks.`); }
+                deps.appendMessage(dest.name, caller.name, text, caller.taskId);
                 deps.changed();
                 deps.log(`sendMessage: "${caller.name}" to "${dest.name}"`);
                 return ok(`Message queued for "${dest.name}" from "${caller.name}".`);
@@ -89,7 +97,9 @@ export function createActorMessageTools(deps: ActorMessageToolDeps): AhpToolSpec
             handler: async ctx => {
                 const caller = callerActor(ctx);
                 if (isResult(caller)) { return caller; }
-                const got = deps.popMessage(caller.name);
+                if (caller.taskId && !deps.isActiveTask?.(caller.taskId)) { return fail('This Jarvis task is not active. Resume it before receiving messages.'); }
+                if (!caller.taskId && deps.canUseLegacy?.(caller.name) === false) { return fail('Use the chat under the active Jarvis task.'); }
+                const got = deps.popMessage(caller.name, caller.taskId);
                 deps.changed();
                 deps.log(`receiveMessage: "${caller.name}", remaining=${got.remaining}`);
                 return ok(JSON.stringify(got.message
@@ -113,13 +123,18 @@ export function createActorMessageTools(deps: ActorMessageToolDeps): AhpToolSpec
                 required: ['actor'],
                 properties: { actor: { type: 'string', description: 'The exact name of the Actor.' } },
             },
-            handler: async (_ctx, input) => {
+            handler: async (ctx, input) => {
+                const task = deps.taskForSession?.(ctx.session);
+                if (task?.retired) { return fail('This chat was replaced. Open the current chat in Jarvis Tasks.'); }
+                if (task && !deps.isActiveTask?.(task.id)) { return fail('This Jarvis task is not active. Resume it before creating a chat.'); }
                 const name = textInput(input, 'actor');
                 if (!name) { return fail('"actor" is required.'); }
                 const found = deps.lookup(name);
                 if (found.status === 'ambiguous') { return fail(found.message); }
                 if (found.status === 'unknown') { return fail(`Actor "${name}" does not exist.\nValid Actors: ${sortedNames()}`); }
-                const session = await deps.ensureChat(found.name);
+                if (task && deps.isTaskActor?.(found.name) === false) { return fail(`Actor "${found.name}" does not participate in Jarvis tasks.`); }
+                if (!task && deps.canUseLegacy?.(found.name) === false) { return fail('Use the chat under the active Jarvis task.'); }
+                const session = await deps.ensureChat(found.name, task?.id);
                 return ok(JSON.stringify({ actor: found.name, session }));
             },
         },

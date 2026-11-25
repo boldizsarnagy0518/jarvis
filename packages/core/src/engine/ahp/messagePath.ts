@@ -7,8 +7,9 @@
 // the tool handlers that reach the inbox) arrives as arguments.
 
 import { randomUUID } from 'crypto';
+import { AhpRpcError } from './connection';
 import {
-    fileUri, listAllSessions, modifiedTime, sessionHasFolder, unwrapSnapshot,
+    ROOT, fileUri, listAllSessions, modifiedTime, sessionHasFolder, unwrapSnapshot,
     type AhpLog, type HostLink, type SessionSummary,
 } from './protocol';
 
@@ -35,6 +36,8 @@ export interface MessagePathOptions {
     workspaceFolder: string;
     /** Names of the Actors of the workspace; the evaluation of the actor.yaml files. */
     actorNames: () => string[];
+    isTaskSession?: (session: string) => boolean;
+    isActiveTaskSession?: (session: string) => boolean;
     tools: AhpToolSpec[];
     provider?: string;
     /** How long to wait for the host to list the agent of an Actor in a session it has just created. */
@@ -49,9 +52,16 @@ export interface MessagePathOptions {
 export interface ActorChatRequest {
     name: string;
     startupText: string;
+    modelId?: string;
+    autoApprove?: boolean;
+    task?: {
+        id: string;
+        session: () => string | undefined;
+        bind: (session: string) => Promise<void>;
+    };
 }
 
-export interface ActorChatSummary { session: string; title: string; modifiedAt: number; folders: string[]; archived: boolean }
+export interface ActorChatSummary { session: string; title: string; modifiedAt: number; folders: string[]; archived: boolean; status?: number }
 
 export interface ActorChat { session: string; created: boolean }
 
@@ -124,13 +134,13 @@ export class MessagePath {
         }
         return sessions
             .filter(s => s.resource && sessionHasFolder(s, this.options.workspaceFolder))
-            .map((s: SessionSummary) => ({ session: s.resource as string, title: s.title ?? '', modifiedAt: modifiedTime(s), folders: s.workingDirectories ?? [], archived: ((s.status ?? 0) & ARCHIVED) !== 0 }));
+            .map((s: SessionSummary) => ({ session: s.resource as string, title: s.title ?? '', modifiedAt: modifiedTime(s), folders: s.workingDirectories ?? [], archived: ((s.status ?? 0) & ARCHIVED) !== 0, status: s.status }));
     }
 
     /** The chat that carries the name of the Actor; the one modified last when several do (titles are not unique). An archived chat is used only when no other carries the name, and is restored first. */
     async findActorChat(actorName: string): Promise<string | undefined> {
         const matches = (await this.listActorChatSessions())
-            .filter(s => s.title === actorName)
+            .filter(s => s.title === actorName && !this.options.isTaskSession?.(s.session))
             .sort((a, b) => Number(a.archived) - Number(b.archived) || b.modifiedAt - a.modifiedAt);
         this.log('info', `chat of Actor "${actorName}" in ${this.options.workspaceFolder}: ${matches.length} match(es)${matches.map(m => `\n  ${m.session} | modified ${m.modifiedAt} | ${m.archived ? 'archived | ' : ''}folders ${m.folders.join(', ') || '-'}`).join('')}`);
         if (matches.length > 1) {
@@ -144,24 +154,77 @@ export class MessagePath {
         return matches[0]?.session;
     }
 
+    async hasPendingWork(session: string): Promise<boolean> {
+        const state = await this.snapshot(session);
+        const chats = new Set<string>((state.chats ?? []).map((chat: { resource: string }) => chat.resource));
+        if (state.defaultChat) { chats.add(state.defaultChat); }
+        for (const chat of chats) {
+            const snapshot = await this.snapshot(chat);
+            if (snapshot.activeTurn || snapshot.queuedMessages?.length) { return true; }
+        }
+        return false;
+    }
+
     /** Finds the chat of an Actor, or creates it (REQ_COM_CHATNAME AC-3). Calls for one Actor run one after the other. */
     ensureActorChat(req: ActorChatRequest): Promise<ActorChat> {
-        const prior: Promise<unknown> = this.creating.get(req.name) ?? Promise.resolve();
+        const key = JSON.stringify([req.task?.id, req.name]);
+        const prior: Promise<unknown> = this.creating.get(key) ?? Promise.resolve();
         const run = prior.catch(() => undefined).then(() => this.findOrCreate(req));
-        this.creating.set(req.name, run);
-        const clear = (): void => { if (this.creating.get(req.name) === run) { this.creating.delete(req.name); } };
+        this.creating.set(key, run);
+        const clear = (): void => { if (this.creating.get(key) === run) { this.creating.delete(key); } };
         run.then(clear, clear);
         return run;
     }
 
     private async findOrCreate(req: ActorChatRequest): Promise<ActorChat> {
         this.need();
-        const existing = await this.findActorChat(req.name);
+        const existing = req.task ? req.task.session() : await this.findActorChat(req.name);
         if (existing) {
+            if (req.task) {
+                const match = (await this.listActorChatSessions()).find(chat => chat.session === existing);
+                if (!match) { throw new Error(`The original chat for Actor "${req.name}" is no longer available for this task.`); }
+                if (match.archived) { await this.send(existing, { type: 'session/isArchivedChanged', isArchived: false }); }
+            }
             await this.ensurePublished(existing);
+            if (req.autoApprove && (this.options.provider ?? 'copilotcli') === 'copilotcli') {
+                try {
+                    await this.need().request('extensions/setSessionApproveAll', { channel: existing, enabled: true });
+                } catch (error) {
+                    if (!(error instanceof AhpRpcError) || error.code !== -32601) {
+                        throw new Error(`Could not enable Allow all for Actor "${req.name}": ${String(error)}`);
+                    }
+                    if (!(await this.requestChatAutoApprove(existing))) {
+                        this.log('warn', `Agent Host does not advertise Allow all for Actor "${req.name}"; leaving permissions unchanged.`);
+                    }
+                }
+            }
             return { session: existing, created: false };
         }
         return { session: await this.createChat(req), created: true };
+    }
+
+    private async requestChatAutoApprove(session: string): Promise<boolean> {
+        const chat = await this.defaultChat(session);
+        const state = await this.snapshot(session);
+        const chatState = await this.snapshot(chat);
+        const config = chatState.config?.schema ? chatState.config : state.config;
+        const modes = chatState.config?.values?.availableApprovalModes ?? state.config?.values?.availableApprovalModes;
+        const property = config?.schema?.properties?.autoApprove;
+        const sessionProperty = state.config?.schema?.properties?.autoApprove;
+        if (property?.readOnly === true || !property?.enum?.includes('autoApprove')
+            || !Array.isArray(modes) || !modes.includes('autoApprove')) { return false; }
+        if (chatState.config?.values?.effectiveApprovalMode === 'autoApprove') { return true; }
+        const root = sessionProperty?.sessionMutable === true && sessionProperty.chatMutable === true
+            ? await this.snapshot(ROOT) : undefined;
+        const multiProvider = root?.config?.schema?.properties?.['multipleChatProviders.enabled']
+            && root.config.values?.['multipleChatProviders.enabled'] === true;
+        const useSession = state.defaultChat === chat && multiProvider || sessionProperty?.chatMutable !== true;
+        if (useSession ? sessionProperty?.sessionMutable !== true || sessionProperty.readOnly === true : property.chatMutable !== true) { return false; }
+        await this.send(useSession ? session : chat, {
+            type: useSession ? 'session/configChanged' : 'chat/configChanged',
+            config: { autoApprove: 'autoApprove' },
+        });
+        return true;
     }
 
     /** SPEC_COM_BINDING, Creating the chat: session, start-up instruction, then the name. */
@@ -171,8 +234,9 @@ export class MessagePath {
         await link.request('createSession', {
             channel: session,
             provider: this.options.provider ?? 'copilotcli',
+            ...(req.modelId ? { model: { id: req.modelId } } : {}),
             workingDirectories: [fileUri(this.options.workspaceFolder)],
-            config: { isolation: 'folder' },
+            config: { isolation: 'folder', ...(req.autoApprove && (this.options.provider ?? 'copilotcli') === 'copilotcli' ? { autoApprove: 'autoApprove' } : {}) },
             activeClient: this.activeClient(),
         });
         await this.track(session);
@@ -180,10 +244,15 @@ export class MessagePath {
         this.log('info', `created the chat of Actor "${req.name}": ${session}`);
 
         const agent = await this.findAgent(session, req.name, this.options.agentWaitCreateMs ?? 8000);
-        await this.queue(session, req.startupText, agent, req.name);
+        if (req.task && !agent) { throw new Error(`The Agent Host did not find the agent for "${req.name}".`); }
+        if (!req.task) { await this.queue(session, req.startupText, agent, req); }
+        await req.task?.bind(session);
         await this.send(session, { type: 'session/titleChanged', title: req.name });
         const t = this.tracked.get(session);
         if (t) { t.title = req.name; }
+        if (req.task) {
+            await this.queue(session, req.startupText, agent, req);
+        }
         return session;
     }
 
@@ -193,7 +262,8 @@ export class MessagePath {
     async deliverAnnouncement(req: ActorChatRequest, count: number): Promise<ActorChat> {
         const chat = await this.ensureActorChat(req);
         const agent = await this.findAgent(chat.session, req.name, this.options.agentWaitExistingMs ?? 3000);
-        await this.queue(chat.session, announcementText(count), agent, req.name);
+        if (req.task && !agent) { throw new Error(`The Agent Host did not find the agent for "${req.name}".`); }
+        await this.queue(chat.session, announcementText(count), agent, req);
         this.log('info', `announced ${count} waiting message(s) to Actor "${req.name}" (${chat.session})`);
         return chat;
     }
@@ -204,16 +274,20 @@ export class MessagePath {
      * would replace the running turn of an existing chat (REQ_COM_NOTIFY AC-4). Every message carries the
      * agent, because the host does not keep it for later messages (FI-2026-10-28).
      */
-    private async queue(session: string, text: string, agent: string | undefined, actorName: string): Promise<void> {
+    private async queue(session: string, text: string, agent: string | undefined, req: ActorChatRequest): Promise<void> {
         const chat = await this.defaultChat(session);
         if (!agent) {
-            this.log('warn', `the Agent Host lists no agent for Actor "${actorName}"; the text goes to ${session} without an agent. The agent file needs a description in its front matter.`);
+            this.log('warn', `the Agent Host lists no agent for Actor "${req.name}"; the text goes to ${session} without an agent. The agent file needs a description in its front matter.`);
         }
         await this.send(chat, {
             type: 'chat/pendingMessageSet',
             kind: 'queued',
             id: randomUUID(),
-            message: { text, origin: { kind: 'user' }, ...(agent ? { agent: { uri: agent } } : {}) },
+            message: {
+                text, origin: { kind: 'user' },
+                ...(agent ? { agent: { uri: agent } } : {}),
+                ...(req.modelId ? { model: { id: req.modelId } } : {}),
+            },
         });
     }
 
@@ -243,7 +317,8 @@ export class MessagePath {
     async publishToExistingSessions(): Promise<void> {
         const names = new Set(this.options.actorNames());
         if (names.size === 0) { return; }
-        const chats = (await this.listActorChatSessions()).filter(c => names.has(c.title));
+        const chats = (await this.listActorChatSessions()).filter(chat => this.options.isTaskSession?.(chat.session)
+            ? this.options.isActiveTaskSession?.(chat.session) : names.has(chat.title));
         let ok = 0;
         for (const c of chats) {
             try { await this.ensurePublished(c.session); ok++; }

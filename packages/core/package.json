@@ -86,6 +86,16 @@
           "name": "Actors"
         },
         {
+          "id": "jarvisWorkflowTasks",
+          "name": "Tasks",
+          "when": "workspaceFolderCount != 0"
+        },
+        {
+          "id": "jarvisTaskUsage",
+          "name": "Token Usage",
+          "visibility": "collapsed"
+        },
+        {
           "id": "jarvisMessages",
           "name": "Messages",
           "when": "config.jarvis.messages.enabled == true"
@@ -103,6 +113,13 @@
       ]
     },
     "commands": [
+      { "command": "jarvis.workflowTask.new", "title": "Jarvis: New Task", "icon": "$(add)" },
+      { "command": "jarvis.workflowTask.resume", "title": "Jarvis: Resume Task", "icon": "$(debug-continue)" },
+      { "command": "jarvis.workflowTask.pause", "title": "Jarvis: Pause Task", "icon": "$(debug-pause)" },
+      { "command": "jarvis.workflowTask.complete", "title": "Jarvis: Complete Task", "icon": "$(check)" },
+      { "command": "jarvis.workflowTask.openChat", "title": "Jarvis: Open Task Chat" },
+      { "command": "jarvis.filterTaskUsageDate", "title": "Filter Token Usage by Date", "icon": "$(calendar)" },
+      { "command": "jarvis.refreshTaskUsage", "title": "Refresh Token Usage", "icon": "$(refresh)" },
       { "command": "jarvis.runHeartbeatJob", "title": "Jarvis: Run Heartbeat Job" },
       { "command": "jarvis.sendMessages", "title": "Jarvis: Send Messages to Chat Session", "icon": "$(debug-start)" },
       { "command": "jarvis.enableAutoDelivery", "title": "Enable Direct Delivery", "icon": "$(zap)" },
@@ -133,6 +150,7 @@
     ],
     "menus": {
       "commandPalette": [
+        { "command": "jarvis.workflowTask.openChat", "when": "false" },
         { "command": "jarvis.openActorSession", "when": "false" },
         { "command": "jarvis.newActor", "when": "false" },
         { "command": "jarvis.rescan", "when": "false" },
@@ -156,12 +174,19 @@
         { "command": "jarvis.openMessageActorChat", "when": "false" }
       ],
       "view/title": [
+        { "command": "jarvis.workflowTask.new", "when": "view == jarvisWorkflowTasks", "group": "navigation@1" },
+        { "command": "jarvis.workflowTask.resume", "when": "view == jarvisWorkflowTasks", "group": "navigation@2" },
+        { "command": "jarvis.filterTaskUsageDate", "when": "view == jarvisTaskUsage", "group": "navigation@1" },
+        { "command": "jarvis.refreshTaskUsage", "when": "view == jarvisTaskUsage", "group": "navigation@2" },
         { "command": "jarvis.newActor", "when": "view == jarvisActors", "group": "navigation@1" },
         { "command": "jarvis.rescan", "when": "view == jarvisActors", "group": "navigation@2" },
         { "command": "jarvis.refreshHeartbeat", "when": "view == jarvisHeartbeat", "group": "navigation@1" }
       ],
       "view/item/context": [
-        { "command": "jarvis.sendMessages", "when": "viewItem == messageSession || viewItem == jarvisSessionManual || viewItem == jarvisSessionAutoDeliver", "group": "inline" },
+        { "command": "jarvis.workflowTask.resume", "when": "view == jarvisWorkflowTasks && viewItem == jarvisWorkflowTaskInactive", "group": "inline" },
+        { "command": "jarvis.workflowTask.pause", "when": "view == jarvisWorkflowTasks && viewItem == jarvisWorkflowTaskActive", "group": "inline@1" },
+        { "command": "jarvis.workflowTask.complete", "when": "view == jarvisWorkflowTasks && viewItem == jarvisWorkflowTaskActive", "group": "inline@2" },
+        { "command": "jarvis.sendMessages", "when": "viewItem == messageSession || viewItem == jarvisSessionManual || viewItem == jarvisSessionAutoDeliver || viewItem == jarvisTaskMessages", "group": "inline" },
         { "command": "jarvis.enableAutoDelivery", "when": "viewItem == jarvisSessionManual", "group": "inline" },
         { "command": "jarvis.disableAutoDelivery", "when": "viewItem == jarvisSessionAutoDeliver", "group": "inline" },
         { "command": "jarvis.deleteMessage", "when": "viewItem == messageItem", "group": "inline" },
@@ -211,8 +236,24 @@
         }
       },
       {
-        "title": "Prompt Templates",
+        "title": "Actor Sessions",
         "properties": {
+          "jarvis.agentSession.models": {
+            "type": "object",
+            "default": {},
+            "additionalProperties": { "type": "string" },
+            "scope": "window",
+            "description": "Agent Host model IDs keyed by exact Actor name. Jarvis requests the configured model when creating a session and queuing an automatic turn. Omit an Actor to keep default model selection."
+          },
+          "jarvis.agentSession.autoApproveActors": {
+            "type": "array",
+            "default": [],
+            "items": { "type": "string" },
+            "uniqueItems": true,
+            "scope": "window",
+            "restricted": true,
+            "description": "Exact Actor names to request Allow all for in Copilot Agent Host sessions. Read only from trusted workspace settings. Allow all approves all available tool calls, subject to host policy. Removing an Actor stops future requests; reset existing sessions using the permissions picker."
+          },
           "jarvis.agentSession.initPromptTemplate": {
             "type": "string",
             "default": "You are the Actor \"${name}\".\n\nUse only `${contextPath}` as your persistent memory. Read it now.\n\nKeep it minimal and action-oriented:\n- Store only long-lived items under Decision / Finding / Next.\n- One concise line per bullet. Prune aggressively.\n- Replace outdated bullets — never append logs.\n- Never store retries, raw tool output, or transient chatter.\n- Before writing, ask: \"Will this still matter in 2 weeks?\" If no, skip.\n- When a topic grows past ~5 bullets, move it to a dedicated file beside `context.md` and leave a one-line summary with a relative link in `context.md`.",

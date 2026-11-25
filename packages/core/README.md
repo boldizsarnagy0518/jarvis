@@ -29,6 +29,16 @@ Jarvis Core 0.33.0 is the actor harness for Visual Studio Code. Since 0.32.0 it 
    - `jarvis_listActors()` returns Actor names and short descriptions. Each Actor's own agent file carries its identity; its persona is referenced from `context.md`. Creating an Actor does not prompt for an agent.
 4. Jarvis will scan your folders and populate the tree views automatically
 
+## Workflow Tasks
+
+In **Jarvis > Tasks**, use **New Task** to open a fresh `lead` chat. The `tester`, `coder`, and `verify` chats are created on demand for that task. Later handoffs reuse its chats and inboxes, even if a different task has an Actor with the same name. The **Actors** view still lists the shared roles and memory.
+
+Only one task is active in the workspace at a time. When its chats are idle, **Pause Task** or **Complete Task** saves the task's `.jarvis/current-plan.md` and leaves its chat history intact. **Resume Task** restores that contract and opens the original `lead` chat. To replace a missing chat, open it from the resumed task and confirm **Create Fresh Chat**.
+
+Switch tasks from one VS Code window per workspace. Task switching does not stash, commit, or restore source files. Leave the working tree ready for the task you are resuming. Legacy Actor inboxes are separate; late messages for inactive tasks wait in their original inbox.
+
+**Token Usage** reads the local Copilot logs of each task's Actor chats, including active and resumed tasks. Tracked tasks do not need usage markers. The date filter uses the most recent recorded usage for tracked tasks and the close date for older marker-based reports.
+
 ## Actor Chats and Messaging
 
 Actor chats require an available, authenticated VS Code Agent Host; there is no fallback to the old chat UI. Click an Actor in ACTORS or choose **Open** to find its chat or create it. Messages and Message Flow open an existing Actor chat only; delivery never opens a tab. Jarvis reuses an existing editor tab or opens a pinned tab in the first editor group. In the Agents window, tick **Created In > jarvis-core** to show Jarvis-created chats. **Mark done** archives a chat; Jarvis restores it on opening or delivery. Only **Delete** removes it.

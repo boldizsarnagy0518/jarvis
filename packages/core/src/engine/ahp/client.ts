@@ -98,6 +98,7 @@ export class AhpClient {
     // ---- message path (SPEC_COM_CLIENTMODULE, interface of the message path step) ----
 
     async listActorChatSessions(): Promise<ActorChatSummary[]> { return this.needPath().listActorChatSessions(); }
+    async hasPendingWork(session: string): Promise<boolean> { return this.needPath().hasPendingWork(session); }
 
     async findActorChat(actorName: string): Promise<string | undefined> { return this.needPath().findActorChat(actorName); }
 
